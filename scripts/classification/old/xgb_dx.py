@@ -32,6 +32,8 @@ from hef_prep import (
     clean_min_bp_outliers, 
     add_engineered_features,
     add_age_interactions,
+    add_composite_scores,
+    add_admission_interactions,
     TARGET_COL_CLASS,
     ID_COLS
 )
@@ -137,7 +139,7 @@ print(f"✓ Base features prepared: {X_train_base.shape[1]} columns")
 # ============================================================================
 # STEP 7: Add age interactions
 # ============================================================================
-print("\n[7/7] Adding age interaction features...")
+print("\n[7/11] Adding age interaction features...")
 
 X_train_with_interactions = add_age_interactions(X_train_base)
 X_test_with_interactions = add_age_interactions(X_test_base)
@@ -145,9 +147,29 @@ X_test_with_interactions = add_age_interactions(X_test_base)
 print(f"✓ After age interactions: {X_train_with_interactions.shape[1]} columns")
 
 # ============================================================================
-# STEP 8: Process ICD9_diagnosis and add to features
+# STEP 8: Add composite severity scores
 # ============================================================================
-print("\n[8/8] Processing ICD9_diagnosis column...")
+print("\n[8/11] Adding composite severity scores...")
+
+X_train_with_composites = add_composite_scores(X_train_with_interactions)
+X_test_with_composites = add_composite_scores(X_test_with_interactions)
+
+print(f"✓ After composite scores: {X_train_with_composites.shape[1]} columns")
+
+# ============================================================================
+# STEP 9: Add admission interactions (BEFORE encoding!)
+# ============================================================================
+print("\n[9/11] Adding admission interaction features...")
+
+X_train_with_admit = add_admission_interactions(X_train_with_composites)
+X_test_with_admit = add_admission_interactions(X_test_with_composites)
+
+print(f"✓ After admission interactions: {X_train_with_admit.shape[1]} columns")
+
+# ============================================================================
+# STEP 10: Process ICD9_diagnosis and add to features
+# ============================================================================
+print("\n[10/11] Processing ICD9_diagnosis column...")
 
 if icd9_col:
     train_icd9 = train_raw[icd9_col].copy().fillna('MISSING')
@@ -158,8 +180,8 @@ if icd9_col:
     all_codes = pd.concat([train_icd9, test_icd9])
     le.fit(all_codes)
     
-    X_train_with_interactions['ICD9_encoded'] = le.transform(train_icd9)
-    X_test_with_interactions['ICD9_encoded'] = le.transform(test_icd9)
+    X_train_with_admit['ICD9_encoded'] = le.transform(train_icd9)
+    X_test_with_admit['ICD9_encoded'] = le.transform(test_icd9)
     
     # Add ICD9 category (first 3 digits)
     train_icd9_category = train_icd9.apply(lambda x: x[:3] if x != 'MISSING' else 'MISSING')
@@ -169,19 +191,19 @@ if icd9_col:
     all_categories = pd.concat([train_icd9_category, test_icd9_category])
     le_category.fit(all_categories)
     
-    X_train_with_interactions['ICD9_category'] = le_category.transform(train_icd9_category)
-    X_test_with_interactions['ICD9_category'] = le_category.transform(test_icd9_category)
+    X_train_with_admit['ICD9_category'] = le_category.transform(train_icd9_category)
+    X_test_with_admit['ICD9_category'] = le_category.transform(test_icd9_category)
     
     print(f"  ✓ Added ICD9_encoded and ICD9_category features")
-    print(f"  Total features now: {X_train_with_interactions.shape[1]}")
+    print(f"  Total features now: {X_train_with_admit.shape[1]}")
 
-X_train_final = X_train_with_interactions
-X_test_final = X_test_with_interactions
+X_train_final = X_train_with_admit
+X_test_final = X_test_with_admit
 
 # ============================================================================
-# STEP 9: Encode any remaining categorical columns
+# STEP 11: Encode any remaining categorical columns
 # ============================================================================
-print("\n[9/9] Encoding categorical columns...")
+print("\n[11/11] Encoding categorical columns...")
 
 cat_cols = X_train_final.select_dtypes(include=['object']).columns.tolist()
 
@@ -201,9 +223,9 @@ if len(cat_cols) > 0:
 print(f"\n✓ FINAL FEATURE COUNT: {X_train_final.shape[1]} features")
 
 # ============================================================================
-# STEP 10: Train XGBoost model (sklearn API)
+# STEP 12: Train XGBoost model (sklearn API)
 # ============================================================================
-print("\n[10/10] Training XGBoost model with sklearn API...")
+print("\n[12/12] Training XGBoost model with sklearn API...")
 
 # Create train/validation split
 X_tr, X_val, y_tr, y_val = train_test_split(
@@ -337,7 +359,7 @@ submission = pd.DataFrame({
 output_dir = BASE_DIR / "submissions"
 output_dir.mkdir(parents=True, exist_ok=True)
 
-output_file = output_dir / "xgboost_with_age_and_icd9.csv"
+output_file = output_dir / "xgboost_v2_with_composites.csv"
 
 submission.to_csv(output_file, index=False)
 
@@ -347,6 +369,46 @@ print(f"  Min:    {y_test_pred.min():.4f}")
 print(f"  Max:    {y_test_pred.max():.4f}")
 print(f"  Mean:   {y_test_pred.mean():.4f}")
 print(f"  Median: {np.median(y_test_pred):.4f}")
+
+# ============================================================================
+# Analyze composite score features
+# ============================================================================
+print("\n" + "="*80)
+print("COMPOSITE SCORE ANALYSIS")
+print("="*80)
+
+composite_keywords = ['score', 'dysfunction', 'shock_state', 'failure_risk', 'critical', 'distress']
+composite_features = importance_df[importance_df['feature'].str.contains('|'.join(composite_keywords), case=False)]
+
+if len(composite_features) > 0:
+    print(f"\nFound {len(composite_features)} composite score features:\n")
+    for idx, row in composite_features.iterrows():
+        rank = list(importance_df.index).index(idx) + 1
+        pct = (row['importance'] / importance_df['importance'].sum() * 100)
+        print(f"  {row['feature']:<35} Rank: #{rank:3d}  Importance: {row['importance']:.6f}  ({pct:.2f}%)")
+    
+    comp_total = composite_features['importance'].sum()
+    print(f"\n  Total COMPOSITE contribution: {(comp_total/importance_df['importance'].sum()*100):.2f}%")
+
+# ============================================================================
+# Analyze admission interaction features
+# ============================================================================
+print("\n" + "="*80)
+print("ADMISSION INTERACTION ANALYSIS")
+print("="*80)
+
+admit_keywords = ['emergency', 'urgent', 'elective', 'is_emergency', 'is_urgent', 'is_elective']
+admit_features = importance_df[importance_df['feature'].str.contains('|'.join(admit_keywords), case=False)]
+
+if len(admit_features) > 0:
+    print(f"\nFound {len(admit_features)} admission-related features:\n")
+    for idx, row in admit_features.iterrows():
+        rank = list(importance_df.index).index(idx) + 1
+        pct = (row['importance'] / importance_df['importance'].sum() * 100)
+        print(f"  {row['feature']:<35} Rank: #{rank:3d}  Importance: {row['importance']:.6f}  ({pct:.2f}%)")
+    
+    admit_total = admit_features['importance'].sum()
+    print(f"\n  Total ADMISSION contribution: {(admit_total/importance_df['importance'].sum()*100):.2f}%")
 
 print(f"\n📊 Final Model Summary:")
 print(f"  Validation AUC: {val_auc:.4f}")
